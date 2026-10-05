@@ -1,0 +1,596 @@
+import { useEffect, useMemo, useState } from 'react';
+import {
+  BackTop, Button, Card, Cursor, Divider, Drawer, Footer, Form, FormItem, Icon,
+  Image, Input, Loading, Modal, Notification, Progress, Radio, Select, Tag, Time,
+  Title, Typewriter, Wallet,
+} from 'animal-island-ui';
+import item351 from 'animal-island-ui/items/item-351.png';
+import item477 from 'animal-island-ui/items/item-477.png';
+import policeBadge from './assets/police-badge.png';
+import { connectLive, isDemoRequested, loadInitialData, loadNetworkLatencies, loadPingLatencies } from './api';
+import type { NetworkLatency } from './api';
+import { redirectToAdmin, safeFilingUrl, safeImageSrc, truncateText } from './security';
+import type { LiveState, LoadMode, NodeInfo, PublicSettings } from './types';
+
+type ViewMode = 'grid' | 'list';
+type Appearance = 'light' | 'dark';
+type SortMode = 'name-asc' | 'name-desc' | 'cpu-desc' | 'memory-desc' | 'network-desc';
+type LoginValues = { username?: string; password?: string; twoFactor?: string };
+
+const REGION_NAMES: Record<string, string> = {
+  CN: '中国大陆', HK: '中国香港', MO: '中国澳门', TW: '中国台湾',
+  SG: '新加坡', US: '美国', JP: '日本', KR: '韩国', DE: '德国',
+  GB: '英国', FR: '法国', CA: '加拿大', AU: '澳大利亚', RU: '俄罗斯',
+  NL: '荷兰', FI: '芬兰', IN: '印度', BR: '巴西',
+};
+
+const regionCode = (region = '') => {
+  const value = region.trim();
+  if (/^[A-Za-z]{2}$/.test(value)) return value.toUpperCase();
+  const points = [...value].map((char) => char.codePointAt(0) ?? 0);
+  if (points.length === 2 && points.every((point) => point >= 0x1f1e6 && point <= 0x1f1ff)) {
+    return String.fromCharCode(...points.map((point) => point - 0x1f1e6 + 65));
+  }
+  return value || 'UNKNOWN';
+};
+const regionLabel = (region = '') => {
+  const code = regionCode(region);
+  return code === 'UNKNOWN' ? '未知地区' : REGION_NAMES[code] || code;
+};
+const BRAND_COLORS = ['app-green', 'app-yellow', 'app-orange', 'app-blue', 'app-pink', 'app-teal'] as const;
+const SORT_OPTIONS: { key: SortMode; label: string }[] = [
+  { key: 'name-asc', label: '名称 A-Z' },
+  { key: 'name-desc', label: '名称 Z-A' },
+  { key: 'cpu-desc', label: 'CPU 高到低' },
+  { key: 'memory-desc', label: '内存高到低' },
+  { key: 'network-desc', label: '网络速率高到低' },
+];
+const SORT_SETTING_VALUES: Record<string, SortMode> = {
+  '名称 A-Z': 'name-asc', '名称 Z-A': 'name-desc', 'CPU 高到低': 'cpu-desc',
+  '内存高到低': 'memory-desc', '网络速率高到低': 'network-desc',
+};
+const normalizeSortMode = (value?: string): SortMode => {
+  if (value && SORT_SETTING_VALUES[value]) return SORT_SETTING_VALUES[value];
+  return SORT_OPTIONS.some((item) => item.key === value) ? value as SortMode : 'name-asc';
+};
+
+const BRAND_TITLE_MAX = 32;
+const BRAND_SUBTITLE_MAX = 64;
+const FOOTER_CONTENT_MAX = 200;
+const FILING_NUMBER_MAX = 64;
+const MIN_UPDATE_INTERVAL_SECONDS = 3;
+const PING_REFRESH_MS = 20000;
+
+/**
+ * setInterval that pauses while the tab is hidden and refreshes once on return
+ * (1.0.8: avoid background ping fan-out).
+ */
+function visibleInterval(refresh: () => void, ms: number): () => void {
+  let timer: number | undefined;
+  const start = () => {
+    if (timer === undefined) timer = window.setInterval(() => { if (!document.hidden) refresh(); }, ms);
+  };
+  const stop = () => {
+    if (timer !== undefined) window.clearInterval(timer);
+    timer = undefined;
+  };
+  const onVisibility = () => {
+    if (document.hidden) { stop(); return; }
+    refresh();
+    start();
+  };
+  if (!document.hidden) start();
+  document.addEventListener('visibilitychange', onVisibility);
+  return () => { stop(); document.removeEventListener('visibilitychange', onVisibility); };
+}
+
+const clamp = (value: number) => Math.max(0, Math.min(100, value));
+const percent = (used = 0, total = 0) => total > 0 ? clamp((used / total) * 100) : 0;
+const formatPercent = (value = 0) => `${Math.round(value)}%`;
+const formatBytes = (value = 0) => {
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = Math.max(0, Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1));
+  return `${(value / 1024 ** index).toFixed(index > 2 ? 2 : 1)} ${units[index]}`;
+};
+const formatSpeed = (value = 0) => `${formatBytes(value)}/s`;
+const formatMoney = (value = 0) => Number.isInteger(value) ? String(value) : value.toFixed(2);
+const hasLivePing = (state?: LiveState) => Boolean(state?.ping && Object.keys(state.ping).length);
+/** Mean of the per-task 1h averages that Komari 1.5+ ships with every status frame. */
+const liveLatency = (state?: LiveState) => {
+  const values = Object.values(state?.ping || {})
+    .map((stat) => stat.avg)
+    .filter((value): value is number => value != null && Number.isFinite(value) && value >= 0);
+  return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
+};
+/** Three-network latency from live ping stats, matched by task name; null when the frame carries no ping data. */
+const liveNetworkLatencies = (state: LiveState | undefined, names: string[]): NetworkLatency[] | null => {
+  if (!hasLivePing(state)) return null;
+  const entries = Object.entries(state!.ping!);
+  return names.flatMap<NetworkLatency>((name) => {
+    const match = entries.find(([, stat]) => stat.name === name);
+    if (!match) return [];
+    const taskId = Number(match[0]);
+    const latency = match[1].avg;
+    return [{ taskId: Number.isFinite(taskId) ? taskId : 0, name, latency: latency == null ? null : Math.round(latency) }];
+  });
+};
+const latencyColor = (latency: number) => latency <= 150 ? 'app-green' : latency <= 300 ? 'app-yellow' : 'app-red';
+const hasBilling = (node: NodeInfo) => Number(node.price) > 0 && Number(node.billing_cycle) !== 0;
+const billingCycleLabel = (cycle = 0) => {
+  if (cycle === -1) return '一次性付费';
+  const presets: Record<number, string> = { 30: '每月', 92: '每季', 365: '每年', 730: '每两年' };
+  return presets[cycle] || `每 ${cycle} 天`;
+};
+const renewalLabel = (node: NodeInfo) => {
+  if (Number(node.billing_cycle) === -1) return '长期一次性';
+  if (!node.expired_at) return '续期日期未设置';
+  const date = new Date(node.expired_at);
+  if (!Number.isFinite(date.getTime())) return '续期日期未设置';
+  return `${node.auto_renewal ? '自动续期' : '到期'} ${date.toLocaleDateString('zh-CN')}`;
+};
+const remainingValue = (node: NodeInfo) => {
+  const price = Number(node.price);
+  const cycle = Number(node.billing_cycle);
+  const expires = node.expired_at ? new Date(node.expired_at).getTime() : 0;
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(cycle) || cycle === 0) return 0;
+  if (cycle === -1) return Math.round(price * 100) / 100;
+  if (cycle < 0 || !Number.isFinite(expires) || expires <= Date.now()) return 0;
+  return Math.round(price * Math.min(1, (expires - Date.now()) / (cycle * 86400000)) * 100) / 100;
+};
+const formatUptime = (seconds = 0) => {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return `${days}天 ${hours}时 ${minutes}分`;
+};
+
+function Metric({ label, used, total }: { label: string; used?: number; total?: number }) {
+  const value = percent(used, total);
+  const displayValue = label === 'CPU' || label.startsWith('GPU')
+    ? `${Math.round(used || 0)}% / ${(total || 100).toFixed(1)}%`
+    : `${formatBytes(used)} / ${formatBytes(total)}`;
+  return (
+    <div className="node-metric">
+      <div className="metric-label"><span>{label}</span><strong>{formatPercent(value)}</strong></div>
+      <Progress percent={value} size="small" showInfo={false} />
+      <span className="metric-value">{displayValue}</span>
+    </div>
+  );
+}
+
+function NodeCard({ node, live, online, latency, networkLatencies = [], showLatency, onDetails }: {
+  node: NodeInfo; live?: LiveState; online: boolean; latency?: number | null; networkLatencies?: NetworkLatency[]; showLatency: boolean; onDetails: () => void;
+}) {
+  const displayedLatency = liveLatency(live) ?? latency;
+  return (
+    <Card className="km-node-card" color={online ? 'default' : 'brown'} pattern={online ? 'app-teal' : 'none'}>
+      <div className="node-heading">
+        <div>
+          <span className={`status-dot ${online ? 'online' : ''}`} aria-hidden="true" />
+          <strong>{node.name}</strong>
+        </div>
+        <div className="node-heading-tags">
+          {showLatency && displayedLatency != null && <Tag className="latency-tag" size="small" color={latencyColor(displayedLatency)} variant="soft">{displayedLatency} ms</Tag>}
+          <Tag size="small" color={online ? 'app-green' : 'brown'} variant="soft">{online ? '在线' : '离线'}</Tag>
+        </div>
+      </div>
+      <div className="node-meta">
+        <span>{online ? formatUptime(live?.uptime) : '等待连接'}</span>
+        <span>{node.virtualization?.toUpperCase() || 'UNKNOWN'} · {node.region || '未知地区'}</span>
+      </div>
+      <Metric label="CPU" used={live?.cpu?.usage} total={100} />
+      <Metric label="内存" used={live?.ram?.used} total={live?.ram?.total || node.mem_total} />
+      <Metric label="硬盘" used={live?.disk?.used} total={live?.disk?.total || node.disk_total} />
+      <Metric label="SWAP" used={live?.swap?.used} total={live?.swap?.total || node.swap_total} />
+      {live?.gpu && <Metric label={live.gpu.count && live.gpu.count > 1 ? `GPU ×${live.gpu.count}` : 'GPU'} used={live.gpu.usage} total={100} />}
+      <div className={`network-grid ${networkLatencies.length ? 'has-network-latency' : ''}`}>
+        <div><strong>实时网络</strong><span>下载 {formatSpeed(live?.network?.down)}</span><span>上传 {formatSpeed(live?.network?.up)}</span></div>
+        <div><strong>总流量</strong><span>接收 {formatBytes(live?.network?.totalDown)}</span><span>发送 {formatBytes(live?.network?.totalUp)}</span></div>
+        {networkLatencies.length > 0 && <div className="network-latency-panel"><strong>三网延迟</strong>{networkLatencies.map((item) => <Tag key={item.taskId} size="small" color={item.latency == null ? 'brown' : latencyColor(item.latency)} variant="soft">{item.name} {item.latency == null ? '—' : item.latency} ms</Tag>)}</div>}
+      </div>
+      <Button type="dashed" size="small" block icon={<Icon name="icon-map" size={18} />} onClick={onDetails}>
+        查看详情
+      </Button>
+    </Card>
+  );
+}
+
+function NodeListRow({ node, live, online, networkLatencies = [], onDetails }: {
+  node: NodeInfo; live?: LiveState; online: boolean; networkLatencies?: NetworkLatency[]; onDetails: () => void;
+}) {
+  return (
+    <Card className={`km-node-row ${networkLatencies.length ? 'has-network-latency' : ''}`} color={online ? 'default' : 'brown'} pattern={online ? 'app-teal' : 'none'}>
+      <div className="row-identity">
+        <span className={`status-dot ${online ? 'online' : ''}`} aria-hidden="true" />
+        <div><strong>{node.name}</strong><span>{regionLabel(node.region)} · {node.virtualization?.toUpperCase() || 'UNKNOWN'}</span></div>
+      </div>
+      <div className="row-stat"><span>CPU</span><strong>{formatPercent(live?.cpu?.usage)}</strong></div>
+      <div className="row-stat"><span>内存</span><strong>{formatPercent(percent(live?.ram?.used, live?.ram?.total || node.mem_total))}</strong></div>
+      <div className="row-stat"><span>硬盘</span><strong>{formatPercent(percent(live?.disk?.used, live?.disk?.total || node.disk_total))}</strong></div>
+      <div className="row-stat row-network"><span>网络</span><strong>↓ {formatSpeed(live?.network?.down)} / ↑ {formatSpeed(live?.network?.up)}</strong></div>
+      {networkLatencies.length > 0 && <div className="row-network-latency"><span>三网延迟</span><div>{networkLatencies.map((item) => <Tag key={item.taskId} size="small" color={item.latency == null ? 'brown' : latencyColor(item.latency)} variant="soft">{item.name} {item.latency == null ? '—' : item.latency} ms</Tag>)}</div></div>}
+      <Tag size="small" color={online ? 'app-green' : 'brown'}>{online ? '在线' : '离线'}</Tag>
+      <Button type="dashed" size="small" icon={<Icon name="icon-map" size={18} />} onClick={onDetails}>详情</Button>
+    </Card>
+  );
+}
+
+export default function App() {
+  const [loading, setLoading] = useState(true);
+  const [settings, setSettings] = useState<PublicSettings>({});
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+  const [live, setLive] = useState<Record<string, LiveState>>({});
+  const [online, setOnline] = useState<string[]>([]);
+  const [latencies, setLatencies] = useState<Record<string, number | null>>({});
+  const [networkLatencies, setNetworkLatencies] = useState<Record<string, NetworkLatency[]>>({});
+  const [pingTasksActive, setPingTasksActive] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [demo, setDemo] = useState(false);
+  // Demo is decided once from the URL (and is always false in production builds).
+  const [demoRequested] = useState(() => isDemoRequested());
+  const [loadMode, setLoadMode] = useState<LoadMode>('live');
+  const [apiError, setApiError] = useState('');
+  const [query, setQuery] = useState('');
+  const [group, setGroup] = useState('all');
+  const [view, setView] = useState<ViewMode>('grid');
+  const [sortMode, setSortMode] = useState<SortMode>('name-asc');
+  const [selected, setSelected] = useState<NodeInfo | null>(null);
+  const [drawer, setDrawer] = useState(false);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [requireTwoFactor, setRequireTwoFactor] = useState(false);
+  const [backgroundVariant] = useState(() => {
+    const previous = Number.parseInt(localStorage.getItem('animal-bg-variant') || '-1', 10);
+    const next = Number.isFinite(previous) ? (previous + 1) % 4 : 0;
+    localStorage.setItem('animal-bg-variant', String(next));
+    return next;
+  });
+  const [appearance, setAppearance] = useState<Appearance>(() =>
+    localStorage.getItem('appearance') === 'dark' ? 'dark' : 'light');
+
+  useEffect(() => {
+    let mounted = true;
+    loadInitialData().then((data) => {
+      if (!mounted) return;
+      setSettings(data.settings); setNodes(data.nodes); setLive(data.live); setDemo(data.demo);
+      setLoadMode(data.mode); setApiError(data.error || '');
+      if (data.demo) setOnline(Object.keys(data.live));
+      window.setTimeout(() => setLoading(false), 650);
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  const configuredUpdateInterval = Number(settings.theme_settings?.data_update_interval);
+  const updateIntervalSeconds = Number.isFinite(configuredUpdateInterval)
+    ? Math.max(MIN_UPDATE_INTERVAL_SECONDS, Math.min(60, configuredUpdateInterval)) : 5;
+
+  // 1.0.8: never start the live channel in demo mode. Previously live frames
+  // replaced online/live but left the 3 mock nodes in `nodes`, so the header
+  // said "实时连接" while fake servers were rendered as the fleet.
+  useEffect(() => {
+    // Private sites deny node data to guests; polling would only collect errors.
+    if (demoRequested || loadMode === 'private') return undefined;
+    return connectLive((nextOnline, nextLive) => {
+      setOnline(nextOnline); setLive(nextLive);
+    }, setConnected, updateIntervalSeconds * 1000);
+  }, [updateIntervalSeconds, demoRequested, loadMode]);
+
+  useEffect(() => {
+    setSortMode(normalizeSortMode(settings.theme_settings?.default_sort));
+  }, [settings.theme_settings?.default_sort]);
+
+  const showNetworkLatency = settings.theme_settings?.show_network_latency === true;
+  const networkLatencyNames = useMemo(() => (settings.theme_settings?.network_latency_order || '')
+    .split(/[,，]/)
+    .map((name) => name.trim())
+    .filter(Boolean), [settings.theme_settings?.network_latency_order]);
+  const showLatency = settings.theme_settings?.show_latency === true && !showNetworkLatency;
+  // Komari 1.5+ includes per-task ping stats in every status frame. When present,
+  // latency is read from there and the per-node ping-record fan-out is skipped.
+  const livePingAvailable = useMemo(() => Object.values(live).some(hasLivePing), [live]);
+  // Wait for the first status frame before deciding, so a 1.5+ server is not
+  // hit with one ping-record request per node on every page load.
+  const liveReceived = Object.keys(live).length > 0;
+
+  useEffect(() => {
+    if (!showLatency || !nodes.length || demo || livePingAvailable || !liveReceived) {
+      setLatencies({});
+      setPingTasksActive(livePingAvailable);
+      return;
+    }
+    let active = true;
+    const refresh = async () => {
+      const result = await loadPingLatencies(nodes.map((node) => node.uuid));
+      if (active) {
+        setLatencies(result.values);
+        setPingTasksActive(result.hasTasks);
+      }
+    };
+    if (!document.hidden) void refresh();
+    const stop = visibleInterval(() => { void refresh(); }, PING_REFRESH_MS);
+    return () => { active = false; stop(); };
+  }, [nodes, demo, showLatency, livePingAvailable, liveReceived]);
+
+  useEffect(() => {
+    if (!showNetworkLatency || !networkLatencyNames.length || !nodes.length || demo || livePingAvailable || !liveReceived) {
+      setNetworkLatencies({});
+      return;
+    }
+    let active = true;
+    const refresh = async () => {
+      const values = await loadNetworkLatencies(nodes.map((node) => node.uuid), networkLatencyNames);
+      if (active) setNetworkLatencies(values);
+    };
+    if (!document.hidden) void refresh();
+    const stop = visibleInterval(() => { void refresh(); }, PING_REFRESH_MS);
+    return () => { active = false; stop(); };
+  }, [nodes, demo, showNetworkLatency, livePingAvailable, liveReceived, networkLatencyNames.join('\u0000')]);
+
+  useEffect(() => {
+    document.documentElement.dataset.appearance = appearance;
+    localStorage.setItem('appearance', appearance);
+  }, [appearance]);
+
+  useEffect(() => {
+    document.body.classList.add('animal-cursor--force');
+    return () => document.body.classList.remove('animal-cursor--force');
+  }, []);
+
+  const regions = useMemo(() => ['all', ...new Set(nodes.map((node) => regionCode(node.region)).filter((code) => code !== 'UNKNOWN'))], [nodes]);
+  const visibleNodes = useMemo(() => nodes.filter((node) => {
+    const text = `${node.name} ${node.region || ''} ${regionLabel(node.region)} ${node.group || ''}`.toLowerCase();
+    return (group === 'all' || regionCode(node.region) === group) && text.includes(query.trim().toLowerCase());
+  }).sort((left, right) => {
+    const leftOnline = demo ? Boolean(live[left.uuid]) : online.includes(left.uuid);
+    const rightOnline = demo ? Boolean(live[right.uuid]) : online.includes(right.uuid);
+    if (settings.theme_settings?.offline_nodes_last !== false && leftOnline !== rightOnline) return leftOnline ? -1 : 1;
+    const leftLive = live[left.uuid];
+    const rightLive = live[right.uuid];
+    let difference = 0;
+    if (sortMode === 'name-desc') difference = right.name.localeCompare(left.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+    else if (sortMode === 'cpu-desc') difference = (rightLive?.cpu?.usage || 0) - (leftLive?.cpu?.usage || 0);
+    else if (sortMode === 'memory-desc') difference = percent(rightLive?.ram?.used, rightLive?.ram?.total || right.mem_total) - percent(leftLive?.ram?.used, leftLive?.ram?.total || left.mem_total);
+    else if (sortMode === 'network-desc') difference = ((rightLive?.network?.down || 0) + (rightLive?.network?.up || 0)) - ((leftLive?.network?.down || 0) + (leftLive?.network?.up || 0));
+    else difference = left.name.localeCompare(right.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+    return difference || left.name.localeCompare(right.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+  }), [nodes, group, query, sortMode, live, online, demo, settings.theme_settings?.offline_nodes_last]);
+  // 1.0.8 (Grok M-02): dashboard totals only count uuids that exist in /api/nodes.
+  const knownUuids = useMemo(() => new Set(nodes.map((node) => node.uuid)), [nodes]);
+  const onlineCount = demo
+    ? Object.keys(live).filter((uuid) => knownUuids.has(uuid)).length
+    : new Set(online.filter((uuid) => knownUuids.has(uuid))).size;
+  const liveValues = Object.entries(live).filter(([uuid]) => knownUuids.has(uuid)).map(([, state]) => state);
+  const averageCpu = liveValues.length ? liveValues.reduce((sum, state) => sum + (state.cpu?.usage || 0), 0) / liveValues.length : 0;
+  const totalDown = liveValues.reduce((sum, state) => sum + (state.network?.totalDown || 0), 0);
+  const totalUp = liveValues.reduce((sum, state) => sum + (state.network?.totalUp || 0), 0);
+  const speedDown = liveValues.reduce((sum, state) => sum + (state.network?.down || 0), 0);
+  const speedUp = liveValues.reduce((sum, state) => sum + (state.network?.up || 0), 0);
+  const current = selected ? live[selected.uuid] : undefined;
+  const theme = settings.theme_settings ?? {};
+  const brandTitle = truncateText(theme.brand_title, BRAND_TITLE_MAX) || '机机森友会';
+  const brandSubtitle = truncateText(theme.brand_subtitle, BRAND_SUBTITLE_MAX) || '集合啦！';
+  const footerContent = truncateText(theme.footer_content, FOOTER_CONTENT_MAX) || '每台服务器，都是这座岛上的好邻居。';
+  const icpNumber = truncateText(theme.icp_number, FILING_NUMBER_MAX);
+  const policeFilingNumber = truncateText(theme.police_filing_number, FILING_NUMBER_MAX);
+  const brandLogo = safeImageSrc(theme.brand_logo_url);
+  const validBrandLogo = Boolean(brandLogo);
+
+  useEffect(() => {
+    document.title = brandTitle;
+  }, [brandTitle]);
+
+  const openResidentLogin = async () => {
+    try {
+      const response = await fetch('/api/me', { credentials: 'same-origin' });
+      const account = await response.json() as { logged_in?: boolean };
+      if (response.ok && account.logged_in) {
+        redirectToAdmin();
+        return;
+      }
+    } catch {
+      // 登录弹窗仍可处理临时的账户状态接口故障。
+    }
+    if (settings.oauth_enable && settings.disable_password_login) {
+      window.location.href = '/api/oauth';
+      return;
+    }
+    setLoginError('');
+    setRequireTwoFactor(false);
+    setLoginOpen(true);
+  };
+
+  const login = async (values: LoginValues) => {
+    setLoginError('');
+    setLoginLoading(true);
+    try {
+      const response = await fetch('/api/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: values.username?.trim(),
+          password: values.password,
+          ...(values.twoFactor?.trim() ? { '2fa_code': values.twoFactor.trim() } : {}),
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as { message?: unknown };
+      // 1.0.8 (Grok L-03): only render string messages, capped.
+      const serverMessage = typeof result.message === 'string' ? result.message.slice(0, 200) : '';
+      if (response.ok) {
+        Notification.success({ message: '欢迎回来，岛民', description: '身份验证成功，正在前往管理后台。' });
+        redirectToAdmin();
+        return;
+      }
+      if (serverMessage === '2FA code is required') {
+        setRequireTwoFactor(true);
+        setLoginError('请输入两步验证码后再次登录。');
+      } else {
+        setLoginError(serverMessage || '身份验证失败，请检查账号和密码。');
+      }
+    } catch {
+      setLoginError('无法连接验证服务，请稍后重试。');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const savePreferences = (values: { appearance?: string }) => {
+    if (values.appearance === 'light' || values.appearance === 'dark') setAppearance(values.appearance);
+    setDrawer(false);
+    Notification.success({ message: '偏好已保存', description: '设置已保存在当前浏览器中。' });
+  };
+
+  return (
+    <Cursor forceAll>
+      <Loading active={loading} className="loading-screen" />
+      <div className={`km-layout bg-variant-${backgroundVariant}`}>
+        <header className="km-navbar">
+          <div className="brand">
+            {validBrandLogo ? <img className="brand-logo" src={brandLogo} alt="" referrerPolicy="no-referrer" decoding="async" /> : <Icon name="icon-helicopter" size={60} bounce />}
+            <div className="brand-copy">
+              <div className="brand-tiles" aria-label={brandTitle}>{[...brandTitle].map((char, index) => <Tag key={`${char}-${index}`} size="medium" color={BRAND_COLORS[index % BRAND_COLORS.length]} variant="solid">{char === ' ' ? '\u00a0' : char}</Tag>)}</div>
+              <span>{brandSubtitle}</span>
+            </div>
+          </div>
+          <div className="header-actions">
+            <Tag color={connected ? 'app-green' : demo || loadMode === 'private' ? 'app-yellow' : 'app-red'} size="small">
+              {connected ? '实时连接' : demo ? '演示数据' : loadMode === 'private' ? '私有站点' : loadMode === 'offline' ? 'API 离线' : '正在重连'}
+            </Tag>
+            <Button type="primary" size="small" icon={<Icon name="icon-design" size={19} />} onClick={() => setDrawer(true)}>设置</Button>
+            <Button type="primary" size="small" icon={<Icon name="icon-variant" size={19} />} onClick={openResidentLogin}>岛民</Button>
+            <Time type="hud" />
+          </div>
+        </header>
+
+        <main className="km-main km-page-instance">
+          {loadMode === 'offline' && (
+            <Card type="dashed" className="empty-state offline-banner" color="brown">
+              <Icon name="icon-map" size={54} />
+              <h2>无法连接监控 API</h2>
+              <p>{apiError || '服务器暂时不可用，未加载任何节点数据。'}{demo ? '' : '（不会显示虚假在线状态）'}</p>
+              <Button type="primary" onClick={() => window.location.reload()}>重新加载</Button>
+            </Card>
+          )}
+          {loadMode === 'private' && (
+            <Card type="dashed" className="empty-state offline-banner" color="brown">
+              <Icon name="icon-map" size={54} />
+              <h2>这座岛屿暂不对访客开放</h2>
+              <p>站点已开启私有模式，登录后即可查看服务器状态。</p>
+              <Button type="primary" onClick={openResidentLogin}>岛民登录</Button>
+            </Card>
+          )}
+          {theme.show_dashboard !== false && loadMode !== 'offline' && loadMode !== 'private' && (
+            <section className="dashboard-section">
+              <Title size="middle" color="app-yellow">监控概览</Title>
+              <div className="stats-grid">
+                <Card color="app-orange" pattern="app-orange"><Image className="summary-item-icon" src={item351} alt="" width={40} height={40} color="app-orange" preview={false} /><div><span>服务器</span><strong>{onlineCount} / {nodes.length}</strong></div></Card>
+                <Card color="app-teal" pattern="app-teal"><Image className="summary-item-icon" src={item477} alt="" width={40} height={40} color="app-teal" preview={false} /><div><span>平均 CPU 使用率</span><strong>{formatPercent(averageCpu)}</strong></div></Card>
+                <Card color="app-blue" pattern="app-blue"><Icon name="icon-miles" size={34} /><div className="summary-network"><span>实时网络速率</span><strong><i>↓ 下行</i><b>{formatSpeed(speedDown)}</b></strong><strong><i>↑ 上行</i><b>{formatSpeed(speedUp)}</b></strong></div></Card>
+                <Card color="app-pink" pattern="app-pink"><Icon name="icon-critterpedia" size={34} /><div className="summary-network"><span>累计流量</span><strong><i>↓ 下行</i><b>{formatBytes(totalDown)}</b></strong><strong><i>↑ 上行</i><b>{formatBytes(totalUp)}</b></strong></div></Card>
+              </div>
+            </section>
+          )}
+
+          {loadMode !== 'offline' && loadMode !== 'private' && <Divider type="wave-yellow" />}
+          {loadMode !== 'offline' && loadMode !== 'private' && <section className="server-section km-instance-server-list">
+            <div className="section-heading">
+              <Title size="middle" color="app-teal">服务器列表</Title>
+              <div className="filters">
+                <Select options={SORT_OPTIONS} value={sortMode} onChange={(value) => setSortMode(value as SortMode)} />
+                <Select options={regions.map((key) => ({ key, label: key === 'all' ? '全部地区' : regionLabel(key) }))} value={group} onChange={setGroup} />
+                <Input className="server-search" value={query} onChange={(event) => setQuery(event.target.value)} allowClear onClear={() => setQuery('')} placeholder="搜索服务器…" prefix={<Icon name="icon-map" size={18} />} />
+                <Radio size="small" value={view} onChange={(value) => setView(value as ViewMode)} options={[{ label: '卡片', value: 'grid' }, { label: '列表', value: 'list' }]} />
+              </div>
+            </div>
+            {visibleNodes.length ? (
+              <div className={`node-grid ${view === 'list' ? 'list-view' : ''}`}>
+                {visibleNodes.map((node) => view === 'list'
+                  ? <NodeListRow key={`${node.uuid}-${live[node.uuid]?.updated_at || ''}`} node={node} live={live[node.uuid]} online={demo ? Boolean(live[node.uuid]) : online.includes(node.uuid)} networkLatencies={showNetworkLatency ? liveNetworkLatencies(live[node.uuid], networkLatencyNames) ?? networkLatencies[node.uuid] : []} onDetails={() => setSelected(node)} />
+                  : <NodeCard key={`${node.uuid}-${live[node.uuid]?.updated_at || ''}`} node={node} live={live[node.uuid]} online={demo ? Boolean(live[node.uuid]) : online.includes(node.uuid)} latency={latencies[node.uuid]} networkLatencies={showNetworkLatency ? liveNetworkLatencies(live[node.uuid], networkLatencyNames) ?? networkLatencies[node.uuid] : []} showLatency={showLatency && pingTasksActive} onDetails={() => setSelected(node)} />)}
+              </div>
+            ) : (
+              <Card type="dashed" className="empty-state"><Icon name="icon-map" size={54} /><h2>这片岛屿上没有找到服务器</h2><Button type="primary" onClick={() => { setQuery(''); setGroup('all'); }}>清除筛选</Button></Card>
+            )}
+          </section>}
+        </main>
+
+        {theme.show_footer !== false && (
+          <footer className="km-footer">
+            <Button type="primary" block className="footer-link-button" onClick={() => { window.location.href = 'https://github.com/imbigbomb/komari-animal-island'; }}>
+              <span>{footerContent}</span>
+              <span>Powered by Komari Monitor.</span>
+            </Button>
+            {((theme.show_icp && icpNumber) || (theme.show_police_filing && policeFilingNumber)) && <div className="filing-links">
+              {(theme.show_icp && icpNumber) && (() => {
+                // https + official filing host (beian.miit.gov.cn / *.gov.cn) only; otherwise plain text.
+                const href = safeFilingUrl(theme.icp_url, 'https://beian.miit.gov.cn/');
+                return href ? <a href={href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">{icpNumber}</a> : <span>{icpNumber}</span>;
+              })()}
+              {(theme.show_police_filing && policeFilingNumber) && (() => {
+                const href = safeFilingUrl(theme.police_filing_url, '');
+                return href
+                  ? <a href={href} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><img src={policeBadge} alt="" />{policeFilingNumber}</a>
+                  : <span><img src={policeBadge} alt="" />{policeFilingNumber}</span>;
+              })()}
+            </div>}
+            <Footer type="sea" />
+          </footer>
+        )}
+      </div>
+
+      <Modal open={Boolean(selected)} width="min(680px, calc(100vw - 64px))" className="detail-modal" maskStyle={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32 }} title={selected && <div className="detail-header"><div className="detail-heading-copy"><strong>{selected.name}</strong><span>{selected.os || '未知系统版本'}</span></div><div className="detail-tags"><Tag color="app-green">{online.includes(selected.uuid) || demo ? '在线' : '离线'}</Tag><Tag color="app-blue">{regionLabel(selected.region)}</Tag><Tag color="app-blue">{selected.virtualization || '未知虚拟化'}</Tag><Tag color="app-blue">{selected.arch || '未知架构'}</Tag></div></div>} onClose={() => setSelected(null)} footer={<Button type="primary" onClick={() => setSelected(null)}>回到岛屿</Button>} typewriter={false}>
+        {selected && <div className="details">
+          <div className="detail-copy">
+            {selected.public_remark && <p>{selected.public_remark}</p>}
+            <div className="detail-info-grid">
+              <Card className={`detail-stat-card${hasBilling(selected) ? '' : ' detail-stat-card--full'}`} pattern="app-teal">
+                <div className="detail-grid">{showLatency && pingTasksActive && (liveLatency(current) ?? latencies[selected.uuid]) != null && <><span>延迟</span><strong>{liveLatency(current) ?? latencies[selected.uuid]} ms</strong></>}<span>负载</span><strong>{current?.load?.load1?.toFixed(2) || '—'}</strong><span>进程</span><strong>{current?.process ?? '—'}</strong><span>TCP / UDP</span><strong>{current?.connections?.tcp ?? '—'} / {current?.connections?.udp ?? '—'}</strong><span>运行时间</span><strong>{formatUptime(current?.uptime)}</strong></div>
+              </Card>
+              {hasBilling(selected) && <Card className="detail-stat-card detail-billing" pattern="app-teal">
+                <strong>{billingCycleLabel(Number(selected.billing_cycle))} {formatMoney(Number(selected.price))} {selected.currency || '—'}</strong>
+                <small>{renewalLabel(selected)}</small>
+                <span>剩余价值 {selected.currency || '—'}</span>
+                <Wallet value={remainingValue(selected)} size="small" />
+              </Card>}
+            </div>
+          </div>
+          <div className="detail-metrics">
+            <Metric label="CPU" used={current?.cpu?.usage} total={100} />
+            <Metric label="内存" used={current?.ram?.used} total={current?.ram?.total || selected.mem_total} />
+            <Metric label="硬盘" used={current?.disk?.used} total={current?.disk?.total || selected.disk_total} />
+            {current?.gpu && <Metric label="GPU" used={current.gpu.usage} total={100} />}
+          </div>
+        </div>}
+      </Modal>
+
+      <Modal open={loginOpen} width="min(460px, calc(100vw - 48px))" className="login-modal" title="岛民身份验证" onClose={() => !loginLoading && setLoginOpen(false)} footer={null} typewriter={false}>
+        <div className="login-intro"><Typewriter speed={42} trigger={loginOpen}>
+          <span>你好，欢迎来到 <strong className="login-brand-highlight">{brandTitle}</strong>！今天的天气真不错呢～</span>
+        </Typewriter></div>
+        {!settings.disable_password_login && <Form layout="vertical" onFinish={(values) => login(values as LoginValues)} requiredMark={false}>
+          <FormItem label="岛民账号" name="username" rules={[{ required: true, message: '请输入岛民账号' }]}><Input autoComplete="username" placeholder="请输入账号" shadow disabled={loginLoading} /></FormItem>
+          <FormItem label="通行密码" name="password" rules={[{ required: true, message: '请输入通行密码' }]}><Input type="password" autoComplete="current-password" placeholder="请输入密码" shadow disabled={loginLoading} /></FormItem>
+          {requireTwoFactor && <FormItem label="两步验证码" name="twoFactor" rules={[{ required: true, message: '请输入两步验证码' }]}><Input inputMode="numeric" autoComplete="one-time-code" placeholder="000000" shadow disabled={loginLoading} /></FormItem>}
+          {loginError && <div className="login-error" role="alert">{loginError}</div>}
+          <FormItem className="login-submit-item"><Button type="primary" htmlType="submit" block loading={loginLoading}>上岛</Button></FormItem>
+        </Form>}
+        {settings.oauth_enable && <div className={`oauth-login ${settings.disable_password_login ? 'oauth-login-only' : ''}`}>
+          <Button type="primary" block disabled={loginLoading} onClick={() => { window.location.href = '/api/oauth'; }}>
+            {settings.oauth_provider?.toLowerCase() === 'github' ? 'Github登录' : `${settings.oauth_provider && settings.oauth_provider !== 'generic' ? settings.oauth_provider : 'OAuth'}登录`}
+          </Button>
+        </div>}
+      </Modal>
+
+      <Drawer open={drawer} title="岛屿显示设置" onClose={() => setDrawer(false)} footer={null}>
+        <Form layout="vertical" initialValues={{ appearance }} onFinish={savePreferences} requiredMark="optional">
+          <FormItem label="外观" name="appearance"><Radio direction="vertical" options={[{ value: 'light', label: '白天岛屿' }, { value: 'dark', label: '夜间岛屿' }]} /></FormItem>
+          <FormItem><Button type="primary" htmlType="submit" block loading={false}>保存偏好</Button></FormItem>
+        </Form>
+      </Drawer>
+      <BackTop visibilityHeight={300} />
+    </Cursor>
+  );
+}
+

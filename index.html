@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#000000" />
+    <!-- Kept loose on purpose: Komari injects the admin's custom head/body here, which may load scripts. -->
+    <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>Komari Monitor</title>
+    <meta name="description" content="A simple server monitor tool." />
+    <style>
+      html, body, #root { margin: 0; min-width: 320px; min-height: 100%; background: #000; }
+      #app-boot-splash { position: fixed; inset: 0; z-index: 10000; background: #000; }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div id="app-boot-splash" aria-hidden="true"></div></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
