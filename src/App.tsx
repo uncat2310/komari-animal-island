@@ -9,7 +9,7 @@ import item477 from 'animal-island-ui/items/item-477.png';
 import policeBadge from './assets/police-badge.png';
 import { connectLive, isDemoRequested, loadInitialData, loadNetworkLatencies, loadPingLatencies } from './api';
 import type { NetworkLatency } from './api';
-import { redirectToAdmin, safeFilingUrl, safeImageSrc, truncateText } from './security';
+import { brandLogoSrc, redirectToAdmin, safeFilingUrl, truncateText } from './security';
 import type { LiveState, LoadMode, NodeInfo, PublicSettings } from './types';
 
 type ViewMode = 'grid' | 'list';
@@ -374,7 +374,7 @@ export default function App() {
   const footerContent = truncateText(theme.footer_content, FOOTER_CONTENT_MAX) || '每台服务器，都是这座岛上的好邻居。';
   const icpNumber = truncateText(theme.icp_number, FILING_NUMBER_MAX);
   const policeFilingNumber = truncateText(theme.police_filing_number, FILING_NUMBER_MAX);
-  const brandLogo = safeImageSrc(theme.brand_logo_url);
+  const brandLogo = brandLogoSrc(theme.brand_logo_url);
   const validBrandLogo = Boolean(brandLogo);
 
   useEffect(() => {

@@ -5,10 +5,10 @@
   },
   "short": "AnimalIsland",
   "description": {
-    "zh-CN": "使用 Animal Island UI 构建的温暖游戏风 Komari 监控主题（1.5.x 安全加固本地版 1.0.9）。",
-    "en": "Warm Animal Island UI theme for Komari, hardened for 1.5.x (local secure fork, 1.0.9)."
+    "zh-CN": "使用 Animal Island UI 构建的温暖游戏风 Komari 监控主题（1.5.x 安全加固本地版 1.0.10）。",
+    "en": "Warm Animal Island UI theme for Komari, hardened for 1.5.x (local secure fork, 1.0.10)."
   },
-  "version": "1.0.9-local",
+  "version": "1.0.10-local",
   "author": "JeraldMaster",
   "url": "https://github.com/imbigbomb/komari-animal-island",
   "preview": "preview.png",
@@ -62,8 +62,8 @@
         "type": "string",
         "default": "",
         "help": {
-          "zh-CN": "仅允许公网域名的 https 直链位图（PNG/WebP/JPEG/GIF），或 data:image/png|webp|jpeg|gif;base64（有大小上限）。禁止 SVG、IP 地址、localhost/*.local/*.internal 等内网地址、javascript:、协议相对链接与图片代理。留空使用内置图标。",
-          "en": "https raster image (png/webp/jpeg/gif) on a public hostname, or capped raster data:image base64. SVG, IP literals, localhost/*.local/*.internal, javascript:, protocol-relative URLs and image proxies are rejected. Empty uses the built-in icon."
+          "zh-CN": "仅允许公网域名的 https 直链位图（PNG/WebP/JPEG/GIF），或 data:image/png|webp|jpeg|gif;base64（有大小上限）。禁止 SVG、IP 地址、localhost/*.local/*.internal 等内网地址、javascript:、协议相对链接与图片代理。留空或不合规时使用主题内置的机机森友会 Logo。",
+          "en": "https raster image (png/webp/jpeg/gif) on a public hostname, or capped raster data:image base64. SVG, IP literals, localhost/*.local/*.internal, javascript:, protocol-relative URLs and image proxies are rejected. Empty or rejected values use the bundled Animal Island logo."
         }
       },
       {

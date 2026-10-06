@@ -1,5 +1,7 @@
 /** URL / media allowlists for admin-controlled theme settings. */
 
+import bundledBrandLogo from './assets/brand-logo.png';
+
 const MAX_DATA_IMAGE_CHARS = 200_000; // ~150KB binary after base64
 
 const BLOCKED_SCHEMES = /^(javascript|data|vbscript|file|blob):/i;
@@ -96,6 +98,38 @@ export function safeImageSrc(raw: string | undefined | null): string {
   } catch {
     return '';
   }
+}
+
+/**
+ * Build-time bundled raster asset (1.0.10). Vite emits it under dist/assets and,
+ * with base './', resolves it relative to the JS bundle, so it works under
+ * whatever path Komari serves the theme from. Only same-origin http(s) raster
+ * paths pass; never cross-origin, never SVG. This path is for compile-time
+ * imports only, admin-supplied values still go through safeImageSrc().
+ */
+export function safeBundledImageSrc(src: string): string {
+  const value = src.trim();
+  if (!value) return '';
+  if (/^data:/i.test(value)) return value.length <= MAX_DATA_IMAGE_CHARS && DATA_IMAGE.test(value) ? value : '';
+  if (BLOCKED_SCHEMES.test(value) || value.startsWith('//') || value.startsWith('\\')) return '';
+  try {
+    const url = new URL(value, window.location.href);
+    if (url.origin !== window.location.origin) return '';
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return '';
+    if (url.username || url.password) return '';
+    if (!IMAGE_EXT.test(url.pathname)) return '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
+/** Default header logo: the bundled 机机森友会 PNG (upstream 1.0.6 default, now same-origin). */
+export const DEFAULT_BRAND_LOGO = safeBundledImageSrc(bundledBrandLogo);
+
+/** Admin logo when it passes safeImageSrc(), else the bundled default ('' → built-in icon). */
+export function brandLogoSrc(raw: string | undefined | null): string {
+  return safeImageSrc(raw) || DEFAULT_BRAND_LOGO;
 }
 
 /** Official filing (备案) hosts. Links to anything else are rendered as plain text. */
